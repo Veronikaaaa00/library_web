@@ -1,0 +1,404 @@
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:provider/provider.dart';
+
+import '../data/seed_data.dart';
+import '../models/book.dart';
+import '../models/book_query.dart';
+import '../state/book_list_notifier.dart';
+import '../widgets/app_scaffold.dart';
+import '../widgets/debounced_search_field.dart';
+import '../widgets/entity_table.dart';
+import '../widgets/load_state_body.dart';
+import '../widgets/pagination_bar.dart';
+
+class BookListScreen extends StatefulWidget {
+  const BookListScreen({super.key});
+
+  @override
+  State<BookListScreen> createState() => _BookListScreenState();
+}
+
+class _BookListScreenState extends State<BookListScreen> {
+  final _yearFromController = TextEditingController();
+  final _yearToController = TextEditingController();
+  var _filtersOpen = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final uriQuery = BookQuery.fromUri(GoRouterState.of(context).uri);
+    final notifier = context.read<BookListNotifier>();
+    if (uriQuery != notifier.query) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        context.read<BookListNotifier>().applyQuery(uriQuery);
+        _syncYearFields(uriQuery);
+      });
+    } else {
+      _syncYearFields(uriQuery);
+    }
+  }
+
+  void _syncYearFields(BookQuery query) {
+    final from = query.yearFrom?.toString() ?? '';
+    final to = query.yearTo?.toString() ?? '';
+    if (_yearFromController.text != from) {
+      _yearFromController.text = from;
+    }
+    if (_yearToController.text != to) {
+      _yearToController.text = to;
+    }
+  }
+
+  @override
+  void dispose() {
+    _yearFromController.dispose();
+    _yearToController.dispose();
+    super.dispose();
+  }
+
+  void _go(BookQuery query) {
+    context.go(query.toLocation());
+  }
+
+  Future<void> _confirmSoftDelete(Book book) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить книгу?'),
+        content: Text(
+          '«${book.title}» будет скрыта из списка (логическое удаление).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && mounted) {
+      await context.read<BookListNotifier>().softDelete(book.id);
+    }
+  }
+
+  Future<void> _confirmDeleteSelected() async {
+    final notifier = context.read<BookListNotifier>();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить выбранные?'),
+        content: Text(
+          'Будет логически удалено записей: ${notifier.selected.length}.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && mounted) {
+      await context.read<BookListNotifier>().deleteSelected();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final notifier = context.watch<BookListNotifier>();
+    final query = notifier.query;
+    final wide = MediaQuery.sizeOf(context).width >= 600;
+
+    return AppScaffold(
+      title: 'Книги',
+      actions: [
+        if (notifier.hasSelection)
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Center(child: Text('Выбрано: ${notifier.selected.length}')),
+          ),
+        if (notifier.hasSelection)
+          IconButton(
+            tooltip: 'Удалить выбранные',
+            onPressed: _confirmDeleteSelected,
+            icon: const Icon(Icons.delete_sweep),
+          ),
+      ],
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            DebouncedSearchField(
+              initialValue: query.search,
+              hintText: 'Поиск по названию или ISBN',
+              onChanged: (value) => _go(query.copyWith(search: value)),
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => setState(() => _filtersOpen = !_filtersOpen),
+                icon: Icon(
+                  _filtersOpen ? Icons.expand_less : Icons.expand_more,
+                ),
+                label: Text(_filtersOpen ? 'Скрыть фильтры' : 'Фильтры'),
+              ),
+            ),
+            if (_filtersOpen) _filters(query),
+            const SizedBox(height: 8),
+            PaginationBar(
+              page: notifier.result.page,
+              totalPages: notifier.result.totalPages,
+              total: notifier.result.total,
+              size: query.size,
+              onPageChanged: (page) => _go(query.copyWith(page: page)),
+              onSizeChanged: (size) => _go(query.copyWith(size: size)),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: LoadStateBody(
+                status: notifier.status,
+                isEmpty: notifier.result.items.isEmpty,
+                error: notifier.error,
+                onRetry: () => context.read<BookListNotifier>().load(),
+                child: wide
+                    ? EntityTable<Book>(
+                        items: notifier.result.items,
+                        idOf: (b) => b.id,
+                        selected: notifier.selected,
+                        onToggleSelect: notifier.toggleSelection,
+                        sortField: query.sortField,
+                        sortAscending: query.sortAscending,
+                        isDeleted: (b) => b.isDeleted,
+                        onSort: (field) => _go(
+                          query.copyWith(
+                            sortField: field,
+                            sortAscending: field == query.sortField
+                                ? !query.sortAscending
+                                : true,
+                          ),
+                        ),
+                        columns: [
+                          TableColumnSpec(
+                            label: 'Название',
+                            sortField: 'title',
+                            build: (b) => InkWell(
+                              onTap: () => context.go('/books/${b.id}'),
+                              child: Text(
+                                b.title,
+                                style: TextStyle(
+                                  color: Theme.of(context).colorScheme.primary,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                          TableColumnSpec(
+                            label: 'ISBN',
+                            sortField: 'isbn',
+                            build: (b) => Text(b.isbn),
+                          ),
+                          TableColumnSpec(
+                            label: 'Год',
+                            sortField: 'year',
+                            numeric: true,
+                            build: (b) => Text('${b.year}'),
+                          ),
+                          TableColumnSpec(
+                            label: 'Страниц',
+                            sortField: 'pages',
+                            numeric: true,
+                            build: (b) => Text('${b.pages}'),
+                          ),
+                          TableColumnSpec(
+                            label: 'Издательство',
+                            build: (b) => Text(
+                              findPublisher(b.publisherId)?.name ?? '—',
+                            ),
+                          ),
+                        ],
+                        actions: (b) => _actions(b),
+                      )
+                    : ListView.separated(
+                        itemCount: notifier.result.items.length,
+                        separatorBuilder: (context, index) =>
+                            const SizedBox(height: 8),
+                        itemBuilder: (context, index) {
+                          final book = notifier.result.items[index];
+                          return _bookCard(book, notifier);
+                        },
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _filters(BookQuery query) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            SizedBox(
+              width: 220,
+              child: DropdownButtonFormField<int?>(
+                key: ValueKey('genre-${query.genreId}'),
+                initialValue: query.genreId,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Жанр',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                items: [
+                  const DropdownMenuItem(value: null, child: Text('Все')),
+                  for (final genre in seedGenres)
+                    DropdownMenuItem(value: genre.id, child: Text(genre.name)),
+                ],
+                onChanged: (value) => _go(query.copyWith(genreId: value)),
+              ),
+            ),
+            SizedBox(
+              width: 220,
+              child: DropdownButtonFormField<int?>(
+                key: ValueKey('publisher-${query.publisherId}'),
+                initialValue: query.publisherId,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Издательство',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                items: [
+                  const DropdownMenuItem(value: null, child: Text('Все')),
+                  for (final publisher in seedPublishers)
+                    DropdownMenuItem(
+                      value: publisher.id,
+                      child: Text(publisher.name),
+                    ),
+                ],
+                onChanged: (value) => _go(query.copyWith(publisherId: value)),
+              ),
+            ),
+            SizedBox(
+              width: 120,
+              child: TextField(
+                controller: _yearFromController,
+                decoration: const InputDecoration(
+                  labelText: 'Год от',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                keyboardType: TextInputType.number,
+                onSubmitted: (value) =>
+                    _go(query.copyWith(yearFrom: int.tryParse(value))),
+              ),
+            ),
+            SizedBox(
+              width: 120,
+              child: TextField(
+                controller: _yearToController,
+                decoration: const InputDecoration(
+                  labelText: 'Год до',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                keyboardType: TextInputType.number,
+                onSubmitted: (value) =>
+                    _go(query.copyWith(yearTo: int.tryParse(value))),
+              ),
+            ),
+            FilledButton.tonal(
+              onPressed: () => _go(
+                query.copyWith(
+                  yearFrom: int.tryParse(_yearFromController.text),
+                  yearTo: int.tryParse(_yearToController.text),
+                ),
+              ),
+              child: const Text('Применить годы'),
+            ),
+            FilterChip(
+              label: const Text('Показать удалённые'),
+              selected: query.includeDeleted,
+              onSelected: (value) => _go(query.copyWith(includeDeleted: value)),
+            ),
+            TextButton(
+              onPressed: () {
+                _yearFromController.clear();
+                _yearToController.clear();
+                _go(const BookQuery());
+              },
+              child: const Text('Сбросить'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _actions(Book book) {
+    if (book.isDeleted) {
+      return [
+        IconButton(
+          tooltip: 'Восстановить',
+          onPressed: () => context.read<BookListNotifier>().restore(book.id),
+          icon: const Icon(Icons.restore),
+        ),
+        IconButton(
+          tooltip: 'Удалить навсегда',
+          onPressed: () => context.read<BookListNotifier>().hardDelete(book.id),
+          icon: const Icon(Icons.delete_forever),
+        ),
+      ];
+    }
+    return [
+      IconButton(
+        tooltip: 'Открыть',
+        onPressed: () => context.go('/books/${book.id}'),
+        icon: const Icon(Icons.visibility_outlined),
+      ),
+      IconButton(
+        tooltip: 'Удалить',
+        onPressed: () => _confirmSoftDelete(book),
+        icon: const Icon(Icons.delete_outline),
+      ),
+    ];
+  }
+
+  Widget _bookCard(Book book, BookListNotifier notifier) {
+    final publisher = findPublisher(book.publisherId)?.name ?? '—';
+    return Card(
+      child: ListTile(
+        leading: Checkbox(
+          value: notifier.selected.contains(book.id),
+          onChanged: (_) => notifier.toggleSelection(book.id),
+        ),
+        title: Text(book.title),
+        subtitle: Text(
+          '${book.year} · $publisher · ${book.isbn}'
+          '${book.isDeleted ? ' · удалена' : ''}',
+        ),
+        trailing: Wrap(children: _actions(book)),
+        onTap: () => context.go('/books/${book.id}'),
+      ),
+    );
+  }
+}
